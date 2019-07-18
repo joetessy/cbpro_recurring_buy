@@ -5,182 +5,149 @@ getting around the massive Coinbase recurring purchase fees."""
 import argparse
 import binascii
 import logging
-from time import sleep
+import time
+import os
 import cbpro
-import config
 
-PARSER = argparse.ArgumentParser(
-    description="python3 cbpro_recurring_buy.py --amount=100 --buy --cryptocurrency='BTC-USD'")
 
-ACTION = PARSER.add_mutually_exclusive_group(required=True)
+def get_parser():
 
-PARSER.add_argument("--amount",
-                    type=int,
-                    help="Amount to deposit or buy (in fiat)",
-                    required=True)
+    parser = argparse.ArgumentParser(description="python3 cbpro_recurring_buy.py --amount=100 --buy --cryptocurrency='BTC-USD'")
+    action = parser.add_mutually_exclusive_group(required=True)
 
-PARSER.add_argument("--fiat_currency", type=str,
-                    help="Fiat base pair to use (default is USD)",
-                    default='USD')
+    parser.add_argument("--amount",
+                        type=int,
+                        help="Amount to deposit or buy (in fiat)",
+                        required=True)
+    parser.add_argument("--fiat_currency", type=str,
+                        help="Fiat base pair to use (default is USD)",
+                        default='USD')
+    parser.add_argument("--cryptocurrency",
+                        type=str,
+                        help="Pair to buy (only supports fiat pairs)")
+    parser.add_argument("--funding_method",
+                        type=str,
+                        help="Payment method to use",
+                        choices=['ach_bank_account'])
+    action.add_argument("--deposit",
+                        action='store_true',
+                        help="Deposit specified amount into wallet")
+    action.add_argument("--buy",
+                        action='store_true',
+                        help="Buy specified amount of BTC (in USD)")
+    parser.add_argument("--debug",
+                        action='store_true',
+                        help="Output debug information to stdout")
 
-PARSER.add_argument("--cryptocurrency",
-                    type=str,
-                    help="Pair to buy (only supports fiat pairs)")
+    return parser
 
-PARSER.add_argument("--funding_method",
-                    type=str,
-                    help="Payment method to use",
-                    choices=['ach_bank_account'])
 
-ACTION.add_argument("--deposit",
-                    action='store_true',
-                    help="Deposit specified amount into wallet")
+def get_logger(debug=False):
+    # TODO revisit to simplify
 
-ACTION.add_argument("--buy",
-                    action='store_true',
-                    help="Buy specified amount of BTC (in USD)")
-
-PARSER.add_argument("--debug",
-                    action='store_true',
-                    help="Output debug information to stdout")
-
-ARGS = PARSER.parse_args()
-
-API_KEY = config.api_key
-API_SECRET = config.api_secret
-API_PASSPHRASE = config.api_passphrase
-FUNDING_METHOD = ARGS.funding_method
-AMOUNT = ARGS.amount
-FUNDING_CURRENCY = ARGS.fiat_currency
-CRYPTOCURRENCY_PAIR = ARGS.cryptocurrency
-
-# Setup logging
-if ARGS.debug:
-    logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s',
-                        level=logging.DEBUG)
-else:
-    logging.basicConfig(
-        filename='cbpro_recurring_buy.log',
-        format='%(asctime)s %(levelname)s: %(message)s',
-        level=logging.INFO)
+    # Setup logging
+    if debug:
+        return logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s',
+                                     level=logging.DEBUG)
+    else:
+        return logging.basicConfig(filename='cbpro_recurring_buy.log',
+                                     format='%(asctime)s %(levelname)s: %(message)s',
+                                     level=logging.INFO)
 
 
 def cbpro_auth(key, secret, passphrase):
     """Function to handle authentication with the Coinbase Pro API"""
-    # Auth with CBPro
+
     try:
-        auth_client = cbpro.AuthenticatedClient(key, secret, passphrase)
+        # Auth with CBPro
+        return cbpro.AuthenticatedClient(key, secret, passphrase)
     except binascii.Error:
-        logging.critical("API secret key is not in proper Base64 format!")
-        exit()
-
-    return auth_client
+        raise RuntimeError("API secret key is not in proper Base64 format!")
 
 
-def deposit_funds(client, account):
+def deposit_funds(client, account, amount, fiat_currency):
     """Function to handle depositing funds from a given payment method
     to the Coinbase Pro fiat wallet"""
 
-    # Get Coinbase Pro funding accounts
-    payment_methods = client.get_payment_methods()
-
-    if 'Invalid API Key' in payment_methods:
-        logging.critical("API key is invalid!")
-        exit()
-
     # Search all payment methods for one matching the given type
-    for method in payment_methods:
-        if method['type'] == account:
+    for method in client.get_payment_methods():
+        if method.get('type', None) == account:
             method_id = method['id']
             method_name = method['name']
-            method_limit_remaining = float(
-                method['limits']['deposit'][0]['remaining']['amount'])
+            method_limit_remaining = method['limits']['deposit'][0]['remaining']['amount']
+            break
+    else:
+        raise RuntimeError("Could not find a payment method matching the selected method")
 
-            logging.debug("Payment method name: %s", method_name)
-            logging.debug("Payment method ID: %s", method_id)
-            logging.debug("Payment method remaining limit: %d", method_limit_remaining)
-
-    # Check that we got a proper payment method
-    try:
-        method_id
-    except NameError:
-        logging.critical("Could not find a payment method matching the selected method")
-        exit()
+    logging.debug(f"Payment method name: {method_name}")
+    logging.debug(f"Payment method ID: {method_id}")
+    logging.debug(f"Payment method remaining limit: {method_limit_remaining}")
 
     # Deposit with above params
-    deposit_response = client.deposit(amount=AMOUNT,
-                                      currency=FUNDING_CURRENCY,
+    deposit_response = client.deposit(amount=amount,
+                                      currency=fiat_currency,
                                       payment_method_id=method_id)
 
-    logging.info(
-        "Deposited %d %s to Coinbase Pro from Coinbase account %s",
-        AMOUNT, FUNDING_CURRENCY, method_name)
-    logging.info("Deposit will be available at %s", deposit_response['payout_at'])
+    logging.info(f"Deposited {amount} {fiat_currency} to Coinbase Pro from Coinbase account {method_name}")
+    logging.info(f"Deposit will be available at {deposit_response['payout_at']}")
 
     return deposit_response
 
 
-def buy_cryptocurrency(client, cryptocurrency):
+def buy_cryptocurrency(client, cryptocurrency, amount, fiat_currency):
     """Function to handle buying the given cryptocurrency pair
     with the payment method provided in deposit_funds"""
 
-    # Place buy of BTC with above params
+    # Place buy of cryptocurrency with above params
     buy_response = client.place_market_order(product_id=cryptocurrency,
                                              side='buy',
-                                             funds=str(AMOUNT))
+                                             funds=str(amount))
 
     if 'Invalid API Key' in buy_response:
-        logging.critical("API key is invalid, please check your credentials!")
-        logging.debug(buy_response)
-        exit()
+        raise RuntimeError(f"API key is invalid, please check your credentials! Error: {buy_response}")
     elif 'Insufficient funds' in buy_response:
-        logging.critical("Insufficient funds to make the purchasein your fiat wallet!")
-        logging.debug(buy_response)
-        exit()
+        raise RuntimeError(f"Insufficient funds to make the purchasein your fiat wallet! Error: {buy_response}")
 
-    try:
-        trade_id = buy_response['id']
-    except KeyError:
-        logging.critical("Unable to get trade ID in returned data, trade failed.")
-        logging.debug(buy_response)
-        exit()
+    if 'id' not in buy_response:
+        raise RuntimeError(f"Unable to get trade ID in returned data, trade failed. Error: {buy_response}")
 
     # Sleep to allow time for trade to complete
-    sleep(5)
+    time.sleep(5)
 
     # Check status of trade
-    executed_trade_response = client.get_order(trade_id)
+    executed_trade_response = client.get_order(buy_response.get('id'))
 
-    if executed_trade_response['settled'] is True:
-        # If trade was successful, gather data and log it
-        fees = float(executed_trade_response['fill_fees'])
-        btc_bought = float(executed_trade_response['filled_size'])
-
-        logging.info("Bought %d %s of BTC, resulting in %.4f BTC", ARGS.amount, FUNDING_CURRENCY, btc_bought)
-        logging.info("Fees: %.4f %s", fees, FUNDING_CURRENCY)
-    else:
+    if not executed_trade_response['settled']:
         # Sleep for longer, should never need to do this unless CBPro is overloaded
-        sleep(30)
-        executed_trade_response = client.get_order(trade_id)
-        fees = float(executed_trade_response['fill_fees'])
-        btc_bought = float(executed_trade_response['filled_size'])
+        time.sleep(30)
+        executed_trade_response = client.get_order(buy_response.get('id'))
 
-        logging.info("Bought %d %s of BTC, resulting in %.4f BTC", ARGS.amount, FUNDING_CURRENCY, btc_bought)
-        logging.info("Fees: %.4f %s", fees, FUNDING_CURRENCY)
+    # If trade was successful, gather data and log it
+    logging.info(f"Bought {amount} {fiat_currency} of {cryptocurrency}, resulting in {executed_trade_response['filled_size']} {cryptocurrency}")
+    logging.info(f"Fees: {executed_trade_response['fill_fees']} {fiat_currency}")
 
     return executed_trade_response
 
 
-if __name__ == '__main__':
+def main():
+
+    parser = get_parser()
+    args = parser.parse_args()
+    get_logger(debug=args.debug)
+
     # Authenticate with Coinbase Pro
-    if ARGS.deposit and not FUNDING_METHOD:
-        PARSER.error("--deposit requires --funding_method")
+    client = cbpro_auth(os.environ['API_KEY'], os.environ['API_SECRET'], os.environ['API_PASSPHRASE'])
 
-    AUTH_CLIENT = cbpro_auth(API_KEY, API_SECRET, API_PASSPHRASE)
+    if args.deposit and not args.funding_method:
+        parser.error("--deposit requires --funding_method")
 
-    if ARGS.deposit:
-        deposit_funds(AUTH_CLIENT, FUNDING_METHOD)
-    elif ARGS.buy:
-        buy_cryptocurrency(AUTH_CLIENT, CRYPTOCURRENCY_PAIR)
+    if args.deposit:
+        deposit_funds(client, args.funding_method, args.amount, args.fiat_currency)
+    elif args.buy:
+        buy_cryptocurrency(client, args.cryptocurrency, args.amount, args.fiat_currency)
     else:
         print("No action flags selected, doing nothing and exiting...")
+
+
+if __name__ == '__main__':
+    main()
