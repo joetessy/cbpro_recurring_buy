@@ -71,7 +71,7 @@ def deposit_funds(client, account, amount, fiat_currency):
 
     # Search all payment methods for one matching the given type
     for method in client.get_payment_methods():
-        if method.get('type', None) == account:
+        if method.get('type', None) == account and method.get('primary_buy', None) == True:
             method_id = method['id']
             method_name = method['name']
             method_limit_remaining = method['limits']['deposit'][0]['remaining']['amount']
